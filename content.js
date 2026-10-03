@@ -7,6 +7,10 @@
  *   2. if the ad is its own short video  -> jumps to its last moment, else
  *   3. if the ad is stitched into a long stream and a countdown is shown
  *      -> jumps forward by the countdown (never past the seekable end).
+ * It also mutes the video during ads and restores sound afterwards.
+ *
+ * Stale-label protection: a countdown label only counts if it is actually
+ * changing. A frozen label (left on screen after the ad ended) is ignored.
  */
 (() => {
     "use strict";
@@ -21,21 +25,23 @@
         MIN_VIDEO_W: 150,
         MIN_VIDEO_H: 80,
         LABEL_CLIMB_LEVELS: 5,        // how far above a video to look for an "Ad 1 of 2" label
-        MUTE_DURING_ADS: true,        // mute the video while an ad is detected, restore afterwards
-        UNMUTE_DELAY_MS: 700          // wait this long after the ad signal disappears before unmuting
+        MUTE_DURING_ADS: true,
+        UNMUTE_DELAY_MS: 1500,
+        REASSERT_MUTE: true,          // players often un-mute themselves at an ad break; keep re-muting during the ad
+        STALE_PLAYED_S: 3,            // video advanced this many seconds while the countdown stayed frozen => stale
+        MAX_STITCHED_REMAINING_S: 120,// ignore countdowns larger than this for forward jumps
+        MAX_BREAK_SKIP_S: 150,        // max total forward jump within one ad break (runaway guard)
+        BREAK_GAP_MS: 4000            // no ad signal for this long => the break is over
     };
 
     const log = (...a) => CONFIG.DEBUG && console.log("[AdSkipper]", ...a);
 
     // ---------- Signal definitions ----------
 
-    // Class fragments meaning "the player is currently in an ad state" (strong)
     const STRONG_CLASS = [
         "ad-showing", "ad-playing", "ad-interrupting", "ima-ad-container",
         "vjs-ad-playing", "jw-flag-ads"
     ];
-    // Class fragments for ad UI that may also appear around normal content (weak:
-    // never trigger a seek on their own, only help when a countdown is present)
     const WEAK_CLASS = [
         "ad-overlay", "ad-badge", "adbadge", "ad-countdown", "adcountdown",
         "ad-timer", "ad-container", "ads-container", "advertisement"
@@ -61,6 +67,9 @@
 
     function isVisible(el) {
         if (!el || !el.isConnected) return false;
+        // Honours opacity / visibility / display of ancestors too (Chrome 105+)
+        if (typeof el.checkVisibility === "function" &&
+            !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
         const r = rectOf(el);
         if (r.width <= 0 || r.height <= 0) return false;
         const s = getComputedStyle(el);
@@ -72,7 +81,6 @@
             a.top < b.bottom + pad && a.bottom > b.top - pad;
     }
 
-    // Is `el` an ancestor of the video, or visibly overlapping it?
     function relatedToVideo(el, video) {
         if (el === document.body || el === document.documentElement) return false;
         if (el.contains(video)) return true;
@@ -92,7 +100,6 @@
         return r.width >= CONFIG.MIN_VIDEO_W && r.height >= CONFIG.MIN_VIDEO_H;
     }
 
-    // The largest visible, playing video on the page
     function isMainVideo(v) {
         if (v.paused || v.readyState < 2) return false;
         const area = (x) => { const r = rectOf(x); return r.width * r.height; };
@@ -103,31 +110,22 @@
 
     // ---------- Detection ----------
 
-    // Returns { strong, remaining, why } or null
-    function detectAdSignal(video) {
-        // 1) player-state classes on the video's ancestors or overlapping it
-        for (const el of document.querySelectorAll(STRONG_SEL)) {
-            if (relatedToVideo(el, video)) {
-                return { strong: true, remaining: labelRemaining(video), why: `class:${el.className && el.className.baseVal === undefined ? String(el.className).slice(0, 40) : "svg"}` };
-            }
+    // Tracks whether a countdown label is really changing (live) or frozen (stale)
+    const labelTrack = new WeakMap(); // video -> { text, changedAt, changes }
+
+    function trackLabel(video, text) {
+        const now = Date.now();
+        let st = labelTrack.get(video);
+        if (!st) {
+            st = { text, changedAt: now, timeAtChange: video.currentTime, changes: 0 };
+            labelTrack.set(video, st);
+        } else if (st.text !== text) {
+            st.text = text;
+            st.changedAt = now;
+            st.timeAtChange = video.currentTime;
+            st.changes++;
         }
-
-        // 2) on-screen label like "Ad 1 of 2 (00:20)"
-        const label = findAdLabel(video);
-        if (label) return { strong: true, remaining: parseSeconds(label), why: `label:"${label}"` };
-
-        // 3) weak UI classes (only useful together with a countdown)
-        for (const el of document.querySelectorAll(WEAK_SEL)) {
-            if (relatedToVideo(el, video)) {
-                return { strong: false, remaining: labelRemaining(video), why: "weak-class" };
-            }
-        }
-        return null;
-    }
-
-    function labelRemaining(video) {
-        const label = findAdLabel(video);
-        return label ? parseSeconds(label) : null;
+        return st;
     }
 
     function findAdLabel(video) {
@@ -146,12 +144,76 @@
         return null;
     }
 
-    // ---------- Actions ----------
+    // Returns { strong, remaining, confirmed, why } or null
+    function detectAdSignal(video) {
+        const label = findAdLabel(video);
+        let remaining = null;
+        let confirmed = true;   // has the countdown been seen changing?
+        let stale = false;
+
+        if (label) {
+            remaining = parseSeconds(label);
+            if (remaining !== null) {
+                const st = trackLabel(video, label);
+                confirmed = st.changes >= 1;
+                stale = !video.paused && video.currentTime - st.timeAtChange > CONFIG.STALE_PLAYED_S;
+                if (stale) remaining = null; // frozen countdown: don't trust it
+            }
+        } else {
+            labelTrack.delete(video);
+        }
+
+        // 1) player-state classes on ancestors of / overlapping the video
+        for (const el of document.querySelectorAll(STRONG_SEL)) {
+            if (relatedToVideo(el, video)) {
+                return { strong: true, remaining, confirmed, why: `class:${String(el.className).slice(0, 40)}` };
+            }
+        }
+
+        // 2) a live ad label
+        if (label && !stale) {
+            return { strong: true, remaining, confirmed, why: `label:"${label}"` };
+        }
+        if (label && stale) {
+            if (CONFIG.DEBUG) log("Ignoring stale label:", label);
+            return null;
+        }
+
+        // 3) weak UI classes (never act on their own)
+        for (const el of document.querySelectorAll(WEAK_SEL)) {
+            if (relatedToVideo(el, video)) return { strong: false, remaining: null, confirmed: false, why: "weak-class" };
+        }
+        return null;
+    }
+
+    // Any seek (ours, the player's or the user's) restarts the stale-label clock
+    document.addEventListener("seeked", (e) => {
+        const st = labelTrack.get(e.target);
+        if (st) { st.changedAt = Date.now(); st.timeAtChange = e.target.currentTime; }
+    }, true);
+
+    // A live stream's duration keeps growing; such a video is the main stream, never a separate ad clip
+    const vinfo = new WeakMap(); // video -> { src, lastDur, live }
+    function isLiveLike(video) {
+        const d = video.duration, src = video.currentSrc;
+        let info = vinfo.get(video);
+        if (!info || info.src !== src) {
+            vinfo.set(video, { src, lastDur: d, live: false });
+            return d === Infinity;
+        }
+        if (isFinite(d) && isFinite(info.lastDur) && d > info.lastDur + 0.5 && d - info.lastDur < 30) info.live = true;
+        info.lastDur = d;
+        return info.live || d === Infinity;
+    }
+
+    // ---------- State ----------
 
     let lastClick = 0;
     let lastStitched = 0;
     let lastEdgeLog = 0;
     let lastDiag = 0;
+    let breakJumped = 0;
+    let breakLastSeen = 0;
 
     // ---- Mute during ads, restore afterwards ----
     const muted = new Map(); // video -> { wasMuted, lastSeen }
@@ -159,10 +221,18 @@
     function muteForAd(video) {
         const now = Date.now();
         const entry = muted.get(video);
-        if (entry) { entry.lastSeen = now; return; }
+        if (entry) {
+            entry.lastSeen = now;
+            // The player reset the mute state (common when a mid-roll starts): mute again
+            if (CONFIG.REASSERT_MUTE && !video.muted) {
+                video.muted = true;
+                log("Re-muted (player had un-muted it)");
+            }
+            return;
+        }
         muted.set(video, { wasMuted: video.muted, lastSeen: now });
         video.muted = true;
-        log("Muted during ad");
+        log("Muted during ad", { volume: video.volume });
     }
 
     function restoreSound() {
@@ -171,13 +241,14 @@
             if (now - entry.lastSeen < CONFIG.UNMUTE_DELAY_MS) continue;
             muted.delete(video);
             if (!video.isConnected) continue;
-            // Only restore if it's still muted by us (don't override a manual change)
             if (video.muted) {
                 video.muted = entry.wasMuted;
                 log("Restored sound after ad");
             }
         }
     }
+
+    // ---------- Actions ----------
 
     function clickSkip(video) {
         if (Date.now() - lastClick < CONFIG.CLICK_COOLDOWN_MS) return false;
@@ -197,17 +268,25 @@
     }
 
     function processVideo(video) {
+        const live = isLiveLike(video);
         const sig = detectAdSignal(video);
-        if (!sig) return;
+        if (!sig || !sig.strong) return;   // weak signals never act
+
+        const now = Date.now();
+        if (now - breakLastSeen > CONFIG.BREAK_GAP_MS) breakJumped = 0; // new ad break
+        breakLastSeen = now;
+
         if (CONFIG.MUTE_DURING_ADS && sig.strong) muteForAd(video);
 
-        if (CONFIG.DEBUG && Date.now() - lastDiag > 2000) {
-            lastDiag = Date.now();
+        if (CONFIG.DEBUG && now - lastDiag > 2000) {
+            lastDiag = now;
             log("Ad signal:", sig.why, "| strong:", sig.strong, "| remaining:", sig.remaining,
+                "| confirmed:", sig.confirmed,
                 "| video:", { dur: video.duration, t: +video.currentTime.toFixed(1), paused: video.paused },
                 "| frame:", location.hostname);
         }
 
+        if (!sig.strong) return;
         if (clickSkip(video)) return;
 
         const d = video.duration;
@@ -217,8 +296,8 @@
         const rem = sig.remaining;
 
         // A) The ad is its own short video -> jump to its last moment
-        const countdownOk = rem === null ? sig.strong : Math.abs(left - rem) <= CONFIG.COUNTDOWN_TOLERANCE_S;
-        if (d <= CONFIG.MAX_AD_SECONDS && countdownOk) {
+        const countdownOk = rem === null ? true : Math.abs(left - rem) <= CONFIG.COUNTDOWN_TOLERANCE_S;
+        if (!live && d <= CONFIG.MAX_AD_SECONDS && countdownOk) {
             if (left < 0.3) return;
             log(`Separate ad video: ${t.toFixed(1)} -> ${d.toFixed(1)}`);
             try { video.currentTime = Math.max(0, d - 0.1); video.play().catch(() => {}); }
@@ -226,22 +305,31 @@
             return;
         }
 
-        // B) The ad is stitched into the stream -> jump forward by the countdown
-        if (rem === null || rem < 1 || !isMainVideo(video)) return;
-        if (Date.now() - lastStitched < CONFIG.STITCHED_COOLDOWN_MS) return;
+        // B) The ad is stitched into the stream -> jump forward by the countdown.
+        //    Only when the countdown is verified to be live (seen changing).
+        if (rem === null || rem < 1 || rem > CONFIG.MAX_STITCHED_REMAINING_S) return;
+        if (!sig.confirmed) return;
+        if (!isMainVideo(video)) return;
+        if (now - lastStitched < CONFIG.STITCHED_COOLDOWN_MS) return;
 
         const edge = video.seekable && video.seekable.length
             ? video.seekable.end(video.seekable.length - 1) : d;
         const target = Math.min(t + rem - 0.5, edge - 0.2);
+        const jump = target - t;
 
-        if (target <= t + 0.3) {
-            if (Date.now() - lastEdgeLog > 3000) {
-                lastEdgeLog = Date.now();
+        if (jump <= 0.3) {
+            if (now - lastEdgeLog > 3000) {
+                lastEdgeLog = now;
                 log(`At live edge (${t.toFixed(1)} / ${edge.toFixed(1)}); cannot skip further`);
             }
             return;
         }
-        lastStitched = Date.now();
+        if (breakJumped + jump > CONFIG.MAX_BREAK_SKIP_S) {
+            log("Break skip budget used up; not jumping further");
+            return;
+        }
+        lastStitched = now;
+        breakJumped += jump;
         log(`Stitched ad: ${t.toFixed(1)} -> ${target.toFixed(1)} (edge ${edge.toFixed(1)})`);
         try { video.currentTime = target; } catch (e) { log("Seek failed", e); }
     }
